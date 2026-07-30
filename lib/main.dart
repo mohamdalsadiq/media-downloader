@@ -1,19 +1,20 @@
 // =============================================================================
 // Media Downloader — تطبيق أندرويد لتنزيل الميديا من روابط المشاركة
 // =============================================================================
-// طريقة العمل:
-//   1) يضغط المستخدم "مشاركة" في تيك توك/إنستغرام/يوتيوب/X ويختار التطبيق
-//   2) يستقبل التطبيق الرابط عبر receive_sharing_intent (SEND + text/plain)
-//   3) تظهر نافذة ModalBottomSheet بخيارين: فيديو MP4 أو صوت MP3
-//   4) يختفي الـ sheet فوراً ويبدأ التنزيل في الخلفية
-//   5) (v2) لو الرابط مباشر لملف (apk/zip/mp4...) يتحول لمدير تنزيل مباشر
+//   1) يستقبل الرابط من زر المشاركة في تيك توك/إنستغرام/يوتيوب/X
+//   2) تظهر نافذة عائمة بخيارين: فيديو MP4 / صوت MP3
+//   3) يستدعي cobalt.tools API (نفس yt-dlp) لاستخراج الرابط المباشر
+//   4) يحمّل الملف بكامله مع شريط تقدّم
+//   5) لو فشل الـ API → يفتح الرابط في المتصفح كـ fallback
 // =============================================================================
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
@@ -31,7 +32,6 @@ class MediaDownloaderApp extends StatelessWidget {
     return MaterialApp(
       title: 'Media Downloader',
       debugShowCheckedModeBanner: false,
-      // دعم RTL لعرض الواجهة بالعربية بشكل صحيح
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
         GlobalWidgetsLocalizations.delegate,
@@ -50,7 +50,7 @@ class MediaDownloaderApp extends StatelessWidget {
 }
 
 // =============================================================================
-// HomeScreen — يستقبل الروابط ويعرض نافذة الخيارات
+// HomeScreen
 // =============================================================================
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -64,6 +64,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _lastUrl = '';
   String _lastStatus = 'في انتظار مشاركة رابط...';
   bool _isDownloading = false;
+  double _downloadProgress = 0.0;
+  int _receivedBytes = 0;
+  int _totalBytes = 0;
 
   @override
   void initState() {
@@ -72,13 +75,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // 1) رابط يصل أثناء عمل التطبيق (المستخدم يضغط "مشاركة" والـ sheet مفتوح)
     _intentSub = ReceiveSharingIntent.instance
         .getMediaStream()
-        .listen(_onShared, onError: _onIntentError);
+        .listen(_processSharedFiles, onError: _onIntentError);
 
-    // 2) رابط يصل عند فتح التطبيق من زر المشاركة
+    // 2) رابط يصل عند فتح التطبيق من زر المشاركة (cold start)
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
-      _onShared(files);
-      // ضروري: تفريغ الـ intent حتى لا يتكرر فتح المشاركة عند فتح التطبيق
-      // من أيقونة المُشغّل في المرات اللاحقة.
+      if (!mounted) return;
+      _processSharedFiles(files);
+      // ضروري: تفريغ الـ intent حتى لا يتكرر عند فتح التطبيق لاحقاً
       ReceiveSharingIntent.instance.reset();
     });
   }
@@ -86,7 +89,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _onIntentError(Object err) {
     debugPrint('getMediaStream error: $err');
     if (mounted) {
-      setState(() => _lastStatus = 'تعذّر قراءة الرابط: $err');
+      setState(() => _lastStatus = 'تعذّر قراءة المشاركة: $err');
     }
   }
 
@@ -96,26 +99,31 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  // استخراج الرابط النصي من أي نوع مشاركة (text أو file)
-  void _onShared(List<SharedMediaFile> files) {
+  // ---------------------------------------------------------------------------
+  // معالجة الملف/النص المشارك
+  // ---------------------------------------------------------------------------
+  void _processSharedFiles(List<SharedMediaFile> files) {
     if (files.isEmpty) return;
     final raw = files.first.path.trim();
     if (raw.isEmpty) return;
     _handleSharedUrl(raw);
   }
 
-  Future<void> _handleSharedUrl(String raw) async {
-    // بعض التطبيقات ترسل "Check out this video: https://..." فيجب استخراج الـ URL
+  void _handleSharedUrl(String raw) {
     final url = _extractUrl(raw) ?? raw;
     setState(() {
       _lastUrl = url;
       _lastStatus = 'تم استلام الرابط ✓';
     });
-    if (!mounted) return;
-    await _showDownloadSheet(url);
+    // ضمان رسم الإطار الأول قبل عرض النافذة (إصلاح bug: عدم ظهور الـ sheet)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _showDownloadSheet(url);
+      }
+    });
   }
 
-  // استخراج أول URL صالح من نص (regex بسيط لـ http/https)
+  // استخراج أول URL صالح من نص (مثل "Check out https://...")
   String? _extractUrl(String text) {
     final reg = RegExp(r'https?://[^\s]+', caseSensitive: false);
     final m = reg.firstMatch(text);
@@ -123,132 +131,42 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // النافذة العائمة من الأسفل (Bottom Sheet) — قلب تجربة المستخدم
+  // النافذة العائمة — قلب تجربة المستخدم
   // ---------------------------------------------------------------------------
   Future<void> _showDownloadSheet(String url) async {
     final isDirect = _looksLikeDirectFile(url);
 
-    await showModalBottomSheet(
+    await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
-      builder: (sheetCtx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // مقبض السحب
-                Container(
-                  width: 40,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[400],
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                const Text(
-                  'خيارات التحميل',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  url,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.grey[600], fontSize: 12),
-                ),
-                const SizedBox(height: 20),
-
-                // ملاحظة v2: لو الرابط مباشر لملف
-                if (isDirect) ...[
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.amber.withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.flash_on, size: 18, color: Colors.amber),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'تم اكتشاف رابط ملف مباشر — سيتم تنزيله بدون معالجة.',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.grey[800],
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                ],
-
-                // زر تحميل فيديو (لغير المباشر فقط)
-                if (!isDirect) ...[
-                  _BigButton(
-                    icon: Icons.download_rounded,
-                    label: 'تحميل فيديو (أعلى جودة)',
-                    subtitle: 'MP4 — بدون علامة مائية',
-                    filled: true,
-                    onTap: () {
-                      Navigator.of(sheetCtx).pop();
-                      _startDownload(url, kind: DownloadKind.video);
-                    },
-                  ),
-                  const SizedBox(height: 10),
-                  _BigButton(
-                    icon: Icons.music_note_rounded,
-                    label: 'تحميل صوت فقط (MP3)',
-                    subtitle: 'استخراج الصوت بأعلى جودة',
-                    filled: false,
-                    onTap: () {
-                      Navigator.of(sheetCtx).pop();
-                      _startDownload(url, kind: DownloadKind.audio);
-                    },
-                  ),
-                  const SizedBox(height: 10),
-                ],
-
-                // زر الملف المباشر (v2)
-                if (isDirect)
-                  _BigButton(
-                    icon: Icons.file_download_rounded,
-                    label: 'تنزيل الملف الآن',
-                    subtitle: _guessFileName(url),
-                    filled: true,
-                    onTap: () {
-                      Navigator.of(sheetCtx).pop();
-                      _startDownload(url, kind: DownloadKind.direct);
-                    },
-                  ),
-
-                const SizedBox(height: 6),
-                TextButton.icon(
-                  onPressed: () => Navigator.of(sheetCtx).pop(),
-                  icon: const Icon(Icons.close, size: 18),
-                  label: const Text('إلغاء'),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+      builder: (sheetCtx) => _DownloadSheet(
+        url: url,
+        isDirect: isDirect,
+        onVideo: () {
+          Navigator.of(sheetCtx).pop();
+          _startDownload(url, kind: DownloadKind.video);
+        },
+        onAudio: () {
+          Navigator.of(sheetCtx).pop();
+          _startDownload(url, kind: DownloadKind.audio);
+        },
+        onDirect: () {
+          Navigator.of(sheetCtx).pop();
+          _startDownload(url, kind: DownloadKind.direct);
+        },
+        onOpenInBrowser: () {
+          Navigator.of(sheetCtx).pop();
+          launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+        },
+        onCancel: () => Navigator.of(sheetCtx).pop(),
+      ),
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // كشف الروابط المباشرة للملفات (apk/zip/mp4/mkv/...) لـ v2
-  // ---------------------------------------------------------------------------
   bool _looksLikeDirectFile(String url) {
     final lower = url.toLowerCase().split('?').first;
     const exts = [
@@ -264,14 +182,14 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final uri = Uri.parse(url);
       final last = uri.pathSegments.isNotEmpty ? uri.pathSegments.last : 'file';
-      return last.isNotEmpty ? last : 'file';
+      return (last.isNotEmpty ? last : 'file').split('?').first;
     } catch (_) {
       return 'file';
     }
   }
 
   // ---------------------------------------------------------------------------
-  // منطق بدء التحميل — يستدعى بعد إغلاق الـ sheet
+  // منطق التحميل — يستدعى بعد إغلاق الـ sheet
   // ---------------------------------------------------------------------------
   Future<void> _startDownload(String url, {required DownloadKind kind}) async {
     if (_isDownloading) {
@@ -279,41 +197,59 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // طلب الصلاحيات (التخزين على أندرويد ≤ 12، الإشعارات على 13+)
     final ok = await _ensurePermissions();
     if (!ok) {
       _toast('يجب منح صلاحيات التخزين والإشعارات للمتابعة.');
       return;
     }
 
-    setState(() => _isDownloading = true);
-    _lastStatus = _statusFor(kind, running: true);
+    setState(() {
+      _isDownloading = true;
+      _downloadProgress = 0.0;
+      _receivedBytes = 0;
+      _totalBytes = 0;
+      _lastStatus = _statusFor(kind, running: true);
+    });
 
+    File? outFile;
     try {
       final dir = await _downloadsDir();
-      final filename = _buildFilename(url, kind);
-      final file = File('${dir.path}/$filename');
+      final ts = DateTime.now().millisecondsSinceEpoch;
 
-      // حالياً: نقل الرابط للخدمة الخلفية أو تنزيل مباشر (v2)
-      // في v1 الفعلي على الجهاز: يتم استدعاء yt-dlp محلياً (Termux مثلاً)
-      // أو إرسال الرابط لخادم خلفي مغلف لـ yt-dlp.
-      // هنا نضع رابط الـ "محرك" التجريبي — استبدله لاحقاً بنهايتك الحقيقية.
-
-      await _simulateOrDirectDownload(url, file, kind);
+      if (kind == DownloadKind.direct) {
+        // رابط ملف مباشر - تحميل مباشر بدون معالجة
+        final name = _guessFileName(url);
+        outFile = File('${dir.path}/$name');
+        await _streamDownload(url, outFile);
+      } else {
+        // فيديو/صوت من منصة - استخدم cobalt.tools API
+        final directUrl =
+            await _cobaltExtract(url, audioOnly: kind == DownloadKind.audio);
+        final ext = kind == DownloadKind.audio ? 'mp3' : 'mp4';
+        outFile = File('${dir.path}/media_$ts.$ext');
+        await _streamDownload(directUrl, outFile);
+      }
 
       if (!mounted) return;
       setState(() {
         _isDownloading = false;
-        _lastStatus = 'تم الحفظ: ${file.path}';
+        _downloadProgress = 0.0;
+        _lastStatus = 'تم الحفظ: ${outFile!.path}';
       });
       _toast('تم بنجاح ✓');
     } catch (e) {
+      debugPrint('Download error: $e');
       if (!mounted) return;
       setState(() {
         _isDownloading = false;
-        _lastStatus = 'فشل التحميل: $e';
+        _downloadProgress = 0.0;
+        _lastStatus = 'فشل التحميل. افتح الرابط في المتصفح.';
       });
-      _toast('فشل التحميل');
+      _toast('فشل التحميل — سيتم فتح المتصفح');
+      // Fallback: افتح الرابط في المتصفح
+      try {
+        await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+      } catch (_) {}
     }
   }
 
@@ -329,24 +265,99 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  String _buildFilename(String url, DownloadKind kind) {
-    final ts = DateTime.now().millisecondsSinceEpoch;
-    switch (kind) {
-      case DownloadKind.video:
-        return 'video_$ts.mp4';
-      case DownloadKind.audio:
-        return 'audio_$ts.mp3';
-      case DownloadKind.direct:
-        return _guessFileName(url);
+  // ---------------------------------------------------------------------------
+  // cobalt.tools API — نفس yt-dlp لكن عبر HTTP
+  // ---------------------------------------------------------------------------
+  Future<String> _cobaltExtract(String url, {required bool audioOnly}) async {
+    final apiUri = Uri.parse('https://api.cobalt.tools/');
+    final body = jsonEncode({
+      'url': url,
+      'videoQuality': '1080',
+      'audioFormat': 'mp3',
+      'downloadMode': audioOnly ? 'audio' : 'auto',
+      'filenameStyle': 'classic',
+    });
+
+    final response = await http
+        .post(apiUri, headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        }, body: body)
+        .timeout(const Duration(seconds: 30));
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('API HTTP ${response.statusCode}');
+    }
+
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final status = (data['status'] as String?) ?? '';
+    if (status == 'redirect' || status == 'tunnel') {
+      return data['url'] as String;
+    } else if (status == 'picker') {
+      // عدة جودات متاحة - خذ الأولى
+      final picker = data['picker'] as List?;
+      if (picker != null && picker.isNotEmpty) {
+        return picker.first['url'] as String;
+      }
+      throw Exception('لم يتم العثور على رابط مباشر');
+    } else {
+      throw Exception('API status: $status');
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // تنزيل HTTP مع شريط تقدّم
+  // ---------------------------------------------------------------------------
+  Future<void> _streamDownload(String url, File outFile) async {
+    final request = http.Request('GET', Uri.parse(url));
+    final response =
+        await request.send().timeout(const Duration(minutes: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception('HTTP ${response.statusCode}');
+    }
+
+    final total = response.contentLength ?? 0;
+    var received = 0;
+    final completer = Completer<void>();
+    final sink = outFile.openWrite();
+
+    if (mounted) {
+      setState(() {
+        _totalBytes = total;
+      });
+    }
+
+    response.stream.listen(
+      (chunk) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (mounted) {
+          setState(() {
+            _receivedBytes = received;
+            _downloadProgress = total > 0 ? received / total : 0.0;
+          });
+        }
+      },
+      onDone: () async {
+        await sink.close();
+        if (!completer.isCompleted) completer.complete();
+      },
+      onError: (e) {
+        sink.close();
+        if (!completer.isCompleted) completer.completeError(e);
+      },
+      cancelOnError: true,
+    );
+
+    return completer.future;
+  }
+
   Future<Directory> _downloadsDir() async {
-    // أندرويد 10+ (API 29): نكتب في مجلد التطبيق الخاص (أكثر أماناً وحداثة)
-    // أندرويد 9 وأقل: نحاول مجلد التنزيلات العامة
     if (Platform.isAndroid) {
       try {
-        return await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+        return await getExternalStorageDirectory() ??
+            await getApplicationDocumentsDirectory();
       } catch (_) {
         return await getApplicationDocumentsDirectory();
       }
@@ -356,29 +367,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<bool> _ensurePermissions() async {
     if (!Platform.isAndroid) return true;
-    // إذن الإشعارات لأندرويد 13+
     if (await Permission.notification.isDenied) {
       await Permission.notification.request();
     }
-    // صلاحية التخزين (تُستخدم فقط على API ≤ 28)
     if (await Permission.storage.isDenied) {
       await Permission.storage.request();
     }
     return true;
-  }
-
-  // تنزيل تجريبي: في v1 الفعلي على أندرويد، يجب أن يتواصل التطبيق مع
-  // (أ) سيرفر خلفي يدير yt-dlp، أو
-  // (ب) تنفيذاً محلياً عبر Termux أو libyt-dlp.
-  // حالياً نسجّل الرابط في كونسول الأندرويد (logcat) وننتظر قليلاً.
-  Future<void> _simulateOrDirectDownload(
-      String url, File outFile, DownloadKind kind) async {
-    debugPrint('DOWNLOAD_START kind=$kind url=$url out=${outFile.path}');
-    // محاكاة زمن المعالجة — استبدلها بطلب HTTP حقيقي عند جاهزية الـ backend
-    await Future.delayed(const Duration(seconds: 1));
-    // كتابة ملف فارغ فقط للتأكد من أن المسار قابل للكتابة
-    await outFile.create(recursive: true);
-    await outFile.writeAsString('placeholder for $url ($kind)');
   }
 
   void _toast(String msg) {
@@ -399,13 +394,20 @@ class _HomeScreenState extends State<HomeScreen> {
         centerTitle: true,
       ),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(20),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const _Header(),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
+              if (_isDownloading) _ProgressCard(
+                progress: _downloadProgress,
+                received: _receivedBytes,
+                total: _totalBytes,
+                status: _lastStatus,
+              ),
+              if (_isDownloading) const SizedBox(height: 16),
               Card(
                 elevation: 0,
                 color: Theme.of(context).colorScheme.surfaceVariant,
@@ -433,13 +435,26 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: () => launchUrl(Uri.parse('https://github.com/'),
-                    mode: LaunchMode.externalApplication),
-                icon: const Icon(Icons.info_outline),
-                label: const Text('حول التطبيق'),
+              // زر اختبار: لصق رابط يدوياً لمعاينة النافذة العائمة
+              OutlinedButton.icon(
+                onPressed: () => _showManualInput(),
+                icon: const Icon(Icons.link),
+                label: const Text('اختبار برابط يدوي'),
               ),
-              const Spacer(),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _isDownloading
+                    ? null
+                    : () {
+                        setState(() {
+                          _lastUrl = '';
+                          _lastStatus = 'في انتظار مشاركة رابط...';
+                        });
+                      },
+                icon: const Icon(Icons.refresh),
+                label: const Text('إعادة التهيئة'),
+              ),
+              const SizedBox(height: 24),
               const _Footer(),
             ],
           ),
@@ -447,11 +462,199 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
+
+  // مربع حوار لاختبار التطبيق برابط يدوي
+  Future<void> _showManualInput() async {
+    final controller = TextEditingController(text: _lastUrl);
+    final url = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('اختبار برابط'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(
+            hintText: 'https://vt.tiktok.com/...',
+            border: OutlineInputBorder(),
+          ),
+          keyboardType: TextInputType.url,
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('متابعة'),
+          ),
+        ],
+      ),
+    );
+
+    if (url != null && url.isNotEmpty) {
+      _handleSharedUrl(url);
+    }
+  }
 }
 
 enum DownloadKind { video, audio, direct }
 
-// زر كبير مع أيقونة وعنوان ووصف فرعي
+// =============================================================================
+// بطاقة التقدّم أثناء التحميل
+// =============================================================================
+class _ProgressCard extends StatelessWidget {
+  const _ProgressCard({
+    required this.progress,
+    required this.received,
+    required this.total,
+    required this.status,
+  });
+
+  final double progress;
+  final int received;
+  final int total;
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (progress * 100).toStringAsFixed(0);
+    final mb = (received / 1024 / 1024).toStringAsFixed(1);
+    final totalMb = total > 0 ? (total / 1024 / 1024).toStringAsFixed(1) : '?';
+    return Card(
+      elevation: 0,
+      color: Theme.of(context).colorScheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.4,
+                    value: total > 0 ? progress : null,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    status,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            LinearProgressIndicator(value: total > 0 ? progress : null),
+            const SizedBox(height: 6),
+            Text(
+              total > 0 ? '$pct%  •  $mb / $totalMb MB' : '$mb MB تم تنزيلها',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// النافذة العائمة
+// =============================================================================
+class _DownloadSheet extends StatelessWidget {
+  const _DownloadSheet({
+    required this.url,
+    required this.isDirect,
+    required this.onVideo,
+    required this.onAudio,
+    required this.onDirect,
+    required this.onOpenInBrowser,
+    required this.onCancel,
+  });
+
+  final String url;
+  final bool isDirect;
+  final VoidCallback onVideo;
+  final VoidCallback onAudio;
+  final VoidCallback onDirect;
+  final VoidCallback onOpenInBrowser;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 16),
+              decoration: BoxDecoration(
+                color: Colors.grey[400],
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const Text('خيارات التحميل',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            Text(
+              url,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey[600], fontSize: 12),
+            ),
+            const SizedBox(height: 20),
+            if (isDirect)
+              _BigButton(
+                icon: Icons.file_download_rounded,
+                label: 'تنزيل الملف الآن',
+                subtitle: 'رابط مباشر لملف',
+                filled: true,
+                onTap: onDirect,
+              )
+            else ...[
+              _BigButton(
+                icon: Icons.download_rounded,
+                label: 'تحميل فيديو (أعلى جودة)',
+                subtitle: 'MP4 — بدون علامة مائية',
+                filled: true,
+                onTap: onVideo,
+              ),
+              const SizedBox(height: 10),
+              _BigButton(
+                icon: Icons.music_note_rounded,
+                label: 'تحميل صوت فقط (MP3)',
+                subtitle: 'استخراج الصوت بأعلى جودة',
+                filled: false,
+                onTap: onAudio,
+              ),
+            ],
+            const SizedBox(height: 14),
+            TextButton.icon(
+              onPressed: onOpenInBrowser,
+              icon: const Icon(Icons.open_in_browser, size: 18),
+              label: const Text('فتح في المتصفح'),
+            ),
+            TextButton.icon(
+              onPressed: onCancel,
+              icon: const Icon(Icons.close, size: 18),
+              label: const Text('إلغاء'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _BigButton extends StatelessWidget {
   const _BigButton({
     required this.icon,
@@ -472,12 +675,10 @@ class _BigButton extends StatelessWidget {
     final fg = filled
         ? Theme.of(context).colorScheme.onPrimary
         : Theme.of(context).colorScheme.primary;
-    final bg = filled
-        ? Theme.of(context).colorScheme.primary
-        : Colors.transparent;
+    final bg = filled ? Theme.of(context).colorScheme.primary : Colors.transparent;
     return SizedBox(
       width: double.infinity,
-      height: 60,
+      height: 64,
       child: filled
           ? ElevatedButton(
               style: ElevatedButton.styleFrom(
@@ -536,7 +737,7 @@ class _Header extends StatelessWidget {
             style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 4),
         Text(
-          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو حتى رابط ملف مباشر، وستظهر لك نافذة التحميل فوراً.',
+          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو حتى رابط ملف مباشر. ستظهر لك نافذة التحميل فوراً.',
           style: TextStyle(color: Colors.grey[700], fontSize: 14),
         ),
       ],
@@ -549,7 +750,7 @@ class _Footer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      'مجاني 100% • بدون إعلانات • بدون تعقيد',
+      'مجاني 100% • بدون إعلانات • مدعوم بـ yt-dlp',
       textAlign: TextAlign.center,
       style: TextStyle(color: Colors.grey[600], fontSize: 12),
     );
