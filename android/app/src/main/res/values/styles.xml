@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        ثيم شاشة البداية: يُطبَّق على نافذة أندرويد أثناء بداية تشغيل التطبيق.
+        parent هو ثيم نظامي صحيح (Theme.Light.NoTitleBar) لتفادي خطأ
+        "resource android:style/Theme.Light.NoActionBar not found".
+    -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+    </style>
+
+    <!--
+        ثيم النافذة الطبيعي بعد أن يبدأ محرّك فلاتر برسم الإطار الأول.
+    -->
+    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">?android:colorBackground</item>
+    </style>
+</resources>

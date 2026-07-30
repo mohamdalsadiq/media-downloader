@@ -1,0 +1,98 @@
+name: Build Flutter APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.6'
+          channel: 'stable'
+          cache: true
+
+      # -------------------------------------------------------------------------
+      # خطوة إصلاح وإكمال ملفات الأندرويد:
+      # 1) نضمن وجود مجلدات res/values, res/values-night, res/drawable
+      # 2) نحفظ ملفاتنا المخصصة في /tmp
+      # 3) نشغّل `flutter create` ليولّد gradle wrapper + build.gradle + MainActivity
+      # 4) نستعيد ملفاتنا فوق ما أنشأه flutter create
+      # -------------------------------------------------------------------------
+      - name: Prepare Android Resources
+        run: |
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/res/values-night
+          mkdir -p android/app/src/main/res/drawable
+          mkdir -p android/app/src/main/res/drawable-v21
+
+      - name: Backup Custom Files
+        run: |
+          set -e
+          BACKUP=/tmp/md_backup
+          rm -rf "$BACKUP"
+          mkdir -p "$BACKUP"
+          [ -f android/app/src/main/AndroidManifest.xml ]               && cp android/app/src/main/AndroidManifest.xml              "$BACKUP/AndroidManifest.xml"
+          [ -f android/app/src/main/res/values/styles.xml ]             && cp android/app/src/main/res/values/styles.xml             "$BACKUP/styles.xml"
+          [ -f android/app/src/main/res/values-night/styles.xml ]       && cp android/app/src/main/res/values-night/styles.xml       "$BACKUP/styles-night.xml"
+          [ -f android/app/src/main/res/drawable/launch_background.xml ] && cp android/app/src/main/res/drawable/launch_background.xml "$BACKUP/launch_background.xml"
+          [ -f android/app/src/main/res/drawable-v21/launch_background.xml ] && cp android/app/src/main/res/drawable-v21/launch_background.xml "$BACKUP/launch_background_v21.xml"
+          [ -f lib/main.dart ]                                          && cp lib/main.dart                                         "$BACKUP/main.dart"
+          [ -f pubspec.yaml ]                                           && cp pubspec.yaml                                          "$BACKUP/pubspec.yaml"
+          echo "==== Backed up files ===="
+          ls -la "$BACKUP"
+
+      - name: Generate Android Files (gradle, kotlin, manifest, styles)
+        run: |
+          flutter config --no-analytics
+          flutter create . --platforms=android --org com.example --project-name media_downloader
+
+      - name: Restore Custom Files
+        run: |
+          set -e
+          BACKUP=/tmp/md_backup
+          [ -f "$BACKUP/AndroidManifest.xml" ]         && cp "$BACKUP/AndroidManifest.xml"         android/app/src/main/AndroidManifest.xml
+          [ -f "$BACKUP/styles.xml" ]                  && cp "$BACKUP/styles.xml"                  android/app/src/main/res/values/styles.xml
+          [ -f "$BACKUP/styles-night.xml" ]            && cp "$BACKUP/styles-night.xml"            android/app/src/main/res/values-night/styles.xml
+          [ -f "$BACKUP/launch_background.xml" ]       && cp "$BACKUP/launch_background.xml"       android/app/src/main/res/drawable/launch_background.xml
+          [ -f "$BACKUP/launch_background_v21.xml" ]   && cp "$BACKUP/launch_background_v21.xml"   android/app/src/main/res/drawable-v21/launch_background.xml
+          [ -f "$BACKUP/main.dart" ]                   && cp "$BACKUP/main.dart"                   lib/main.dart
+          [ -f "$BACKUP/pubspec.yaml" ]                && cp "$BACKUP/pubspec.yaml"                pubspec.yaml
+          echo "==== Restored custom files ===="
+          ls -la android/app/src/main/AndroidManifest.xml android/app/src/main/res/values/styles.xml lib/main.dart pubspec.yaml
+
+      - name: Verify Critical Theme Fix
+        run: |
+          echo "==== AndroidManifest.xml theme lines ===="
+          grep -nE "android:theme|android:resource" android/app/src/main/AndroidManifest.xml || true
+          echo ""
+          echo "==== styles.xml ===="
+          cat android/app/src/main/res/values/styles.xml
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- خلفية شاشة البداية: لون أبيض موحّد (سيتم استبداله لاحقاً بشعار التطبيق) -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="?android:colorBackground" />
+</layer-list>
