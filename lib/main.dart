@@ -308,9 +308,15 @@ class _HomeScreenState extends State<HomeScreen> {
         outFile = File('${dir.path}/${_guessFileName(url)}');
         await _streamDownload(url, outFile);
       } else {
-        final directUrl =
-            await _cobaltExtract(url, audioOnly: kind == DownloadKind.audio);
-        final ext = kind == DownloadKind.audio ? 'mp3' : 'mp4';
+        // نطلب من السيرفر الرابط المباشر + نوع الملف (mp4, m4a, webm...)
+        final extracted = await _cobaltExtract(
+          url,
+          audioOnly: kind == DownloadKind.audio,
+        );
+        final directUrl = extracted['url'] as String;
+        // استخدم الـ ext الذي رجعه السيرفر (مهم: m4a للـ MP3-like على أندرويد)
+        final ext = (extracted['ext'] as String?) ??
+            (kind == DownloadKind.audio ? 'm4a' : 'mp4');
         outFile = File('${dir.path}/media_$ts.$ext');
         await _streamDownload(directUrl, outFile);
       }
@@ -353,11 +359,15 @@ class _HomeScreenState extends State<HomeScreen> {
   // ---------------------------------------------------------------------------
   // استدعاء الـ API (افتراضياً cobalt.tools، أو سيرفر مخصّص)
   // ---------------------------------------------------------------------------
-  Future<String> _cobaltExtract(String url, {required bool audioOnly}) async {
+  Future<Map<String, dynamic>> _cobaltExtract(
+    String url, {
+    required bool audioOnly,
+  }) async {
     final body = jsonEncode({
       'url': url,
       'videoQuality': '1080',
-      'audioFormat': 'mp3',
+      'audioFormat': 'best', // تغيير: لا نطلب mp3، نأخذ أفضل ملف صوتي
+      'audioBitrate': '320',
       'downloadMode': audioOnly ? 'audio' : 'auto',
       'filenameStyle': 'classic',
     });
@@ -371,17 +381,18 @@ class _HomeScreenState extends State<HomeScreen> {
         .timeout(const Duration(seconds: 30));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('API HTTP ${response.statusCode}\n${_shortError(response.body)}');
+      throw Exception(
+          'API HTTP ${response.statusCode}\n${_shortError(response.body)}');
     }
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     final status = (data['status'] as String?) ?? '';
     if (status == 'redirect' || status == 'tunnel') {
-      return data['url'] as String;
+      return data;
     } else if (status == 'picker') {
       final picker = data['picker'] as List?;
       if (picker != null && picker.isNotEmpty) {
-        return picker.first['url'] as String;
+        return Map<String, dynamic>.from(picker.first as Map);
       }
       throw Exception('لم يتم العثور على رابط مباشر');
     } else {
