@@ -1,9 +1,6 @@
 // =============================================================================
 // Media Downloader Flutter App - Version 2.0
 // =============================================================================
-// A comprehensive video downloader app supporting YouTube, TikTok, Instagram,
-// Twitter, Facebook, and many other platforms.
-// =============================================================================
 
 import 'dart:async';
 import 'dart:convert';
@@ -23,7 +20,6 @@ import 'package:url_launcher/url_launcher.dart';
 // Configuration
 // =============================================================================
 const String _kApiUrlKey = 'api_base_url';
-// تم تعيين رابط سيرفرك الخاص على Render كافتراضي
 const String _kDefaultApiUrl = 'https://media-downloader-api-xndz.onrender.com/';
 
 void main() {
@@ -381,7 +377,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     final connectivity = await Connectivity().checkConnectivity();
-    if (connectivity.every((r) => r == ConnectivityResult.none)) {
+    if (connectivity == ConnectivityResult.none) {
       _toast('لا يوجد اتصال إنترنت');
       return;
     }
