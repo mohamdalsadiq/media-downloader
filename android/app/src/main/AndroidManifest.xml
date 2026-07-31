@@ -53,11 +53,32 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
 
-            <!-- استقبال روابط المشاركة من التطبيقات الأخرى (text/plain) -->
+            <!-- استقبال روابط المشاركة من التطبيقات الأخرى (text/* — يشمل text/plain) -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/*" />
+            </intent-filter>
+
+            <!-- استقبال الفيديوهات المشاركة مباشرة (كثير من التطبيقات تستخدم هذا) -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+
+            <!-- استقبال الصور المشاركة (reels كألبوم، صور تيك توك، إلخ) -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+
+            <!-- استقبال ملفات متعددة (SEND_MULTIPLE — ألبومات كاملة) -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/*" />
             </intent-filter>
         </activity>
     </application>

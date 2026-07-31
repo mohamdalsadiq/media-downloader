@@ -28,6 +28,12 @@ dependencies:
   # تنزيل الملفات المباشرة (v2) + قياس تقدم التنزيل
   http: ^1.2.0
 
+  # فحص اتصال الإنترنت قبل البدء
+  connectivity_plus: ^5.0.2
+
+  # تخزين الإعدادات (رابط الـ API المخصّص) محلياً
+  shared_preferences: ^2.2.2
+
   # أيقونات iOS-style احتياطية
   cupertino_icons: ^1.0.6
 

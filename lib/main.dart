@@ -3,22 +3,31 @@
 // =============================================================================
 //   1) يستقبل الرابط من زر المشاركة في تيك توك/إنستغرام/يوتيوب/X
 //   2) تظهر نافذة عائمة بخيارين: فيديو MP4 / صوت MP3
-//   3) يستدعي cobalt.tools API (نفس yt-dlp) لاستخراج الرابط المباشر
-//   4) يحمّل الملف بكامله مع شريط تقدّم
-//   5) لو فشل الـ API → يفتح الرابط في المتصفح كـ fallback
+//   3) يستدعي الـ API المعرّف في الإعدادات (افتراضياً cobalt.tools)
+//   4) لو فشل → fallback: يفتح الرابط في المتصفح
+//
+//   الإعدادات تسمح بتغيير الـ API إلى سيرفر خاص فيك (مثل yt-dlp على Render)
 // =============================================================================
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+
+// =============================================================================
+// مفاتيح الإعدادات + الافتراضات
+// =============================================================================
+const String _kApiUrlKey = 'api_base_url';
+const String _kDefaultApiUrl = 'https://api.cobalt.tools/';
 
 void main() {
   runApp(const MediaDownloaderApp());
@@ -63,27 +72,46 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription? _intentSub;
   String _lastUrl = '';
   String _lastStatus = 'في انتظار مشاركة رابط...';
+  String _apiBaseUrl = _kDefaultApiUrl;
   bool _isDownloading = false;
   double _downloadProgress = 0.0;
   int _receivedBytes = 0;
   int _totalBytes = 0;
+  bool _apiOnline = true;
+  bool _checkingApi = false;
 
   @override
   void initState() {
     super.initState();
 
-    // 1) رابط يصل أثناء عمل التطبيق (المستخدم يضغط "مشاركة" والـ sheet مفتوح)
+    // تحميل الإعدادات المحفوظة
+    _loadSettings();
+
+    // 1) رابط يصل أثناء عمل التطبيق
     _intentSub = ReceiveSharingIntent.instance
         .getMediaStream()
         .listen(_processSharedFiles, onError: _onIntentError);
 
-    // 2) رابط يصل عند فتح التطبيق من زر المشاركة (cold start)
+    // 2) رابط يصل عند فتح التطبيق من زر المشاركة
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (!mounted) return;
       _processSharedFiles(files);
-      // ضروري: تفريغ الـ intent حتى لا يتكرر عند فتح التطبيق لاحقاً
       ReceiveSharingIntent.instance.reset();
     });
+  }
+
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final url = prefs.getString(_kApiUrlKey);
+    if (url != null && url.isNotEmpty) {
+      setState(() => _apiBaseUrl = url);
+    }
+  }
+
+  Future<void> _saveApiUrl(String url) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kApiUrlKey, url);
+    setState(() => _apiBaseUrl = url);
   }
 
   void _onIntentError(Object err) {
@@ -115,7 +143,6 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastUrl = url;
       _lastStatus = 'تم استلام الرابط ✓';
     });
-    // ضمان رسم الإطار الأول قبل عرض النافذة (إصلاح bug: عدم ظهور الـ sheet)
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _showDownloadSheet(url);
@@ -123,19 +150,30 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // استخراج أول URL صالح من نص (مثل "Check out https://...")
   String? _extractUrl(String text) {
-    final reg = RegExp(r'https?://[^\s]+', caseSensitive: false);
+    // ابحث عن أول URL صالح (http/https)
+    final reg = RegExp(r'https?://[^\s\u0000-\u001F]+', caseSensitive: false);
     final m = reg.firstMatch(text);
-    return m?.group(0);
+    if (m == null) return null;
+    var url = m.group(0)!;
+    // إزالة أي علامات ترتيب في البداية (=, :, فاصلة، إلخ)
+    while (url.isNotEmpty &&
+        !RegExp(r'^[a-zA-Z]').hasMatch(url[0]) &&
+        !url.startsWith('http')) {
+      url = url.substring(1);
+    }
+    // إزالة علامات في النهاية (.,;!? إلخ)
+    while (url.isNotEmpty && '.,;!?)]}\'"'.contains(url[url.length - 1])) {
+      url = url.substring(0, url.length - 1);
+    }
+    return url;
   }
 
   // ---------------------------------------------------------------------------
-  // النافذة العائمة — قلب تجربة المستخدم
+  // النافذة العائمة
   // ---------------------------------------------------------------------------
   Future<void> _showDownloadSheet(String url) async {
     final isDirect = _looksLikeDirectFile(url);
-
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -189,7 +227,49 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // منطق التحميل — يستدعى بعد إغلاق الـ sheet
+  // اختبار اتصال الـ API
+  // ---------------------------------------------------------------------------
+  Future<void> _testApi() async {
+    setState(() => _checkingApi = true);
+    try {
+      final connectivity = await Connectivity().checkConnectivity();
+      final hasNet = connectivity.any((r) => r != ConnectivityResult.none);
+      if (!hasNet) {
+        setState(() {
+          _apiOnline = false;
+          _checkingApi = false;
+          _lastStatus = 'لا يوجد اتصال إنترنت على الجهاز';
+        });
+        return;
+      }
+      // جرّب ping بسيط على الـ API
+      final res = await http
+          .get(Uri.parse(_apiBaseUrl), headers: {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 10));
+      setState(() {
+        _apiOnline = res.statusCode < 500;
+        _checkingApi = false;
+        _lastStatus = _apiOnline
+            ? '✓ الـ API شغّال (HTTP ${res.statusCode})'
+            : '⚠ الـ API راجع خطأ: HTTP ${res.statusCode}';
+      });
+    } catch (e) {
+      setState(() {
+        _apiOnline = false;
+        _checkingApi = false;
+        _lastStatus = '✗ لا يمكن الوصول للـ API: ${_shortError(e)}';
+      });
+    }
+  }
+
+  String _shortError(Object e) {
+    final s = e.toString();
+    if (s.length > 120) return '${s.substring(0, 120)}…';
+    return s;
+  }
+
+  // ---------------------------------------------------------------------------
+  // منطق التحميل
   // ---------------------------------------------------------------------------
   Future<void> _startDownload(String url, {required DownloadKind kind}) async {
     if (_isDownloading) {
@@ -197,6 +277,14 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    // 1) فحص الاتصال
+    final connectivity = await Connectivity().checkConnectivity();
+    if (connectivity.every((r) => r == ConnectivityResult.none)) {
+      _toast('لا يوجد اتصال إنترنت. شغّل الواي فاي أو البيانات.');
+      return;
+    }
+
+    // 2) فحص الصلاحيات
     final ok = await _ensurePermissions();
     if (!ok) {
       _toast('يجب منح صلاحيات التخزين والإشعارات للمتابعة.');
@@ -217,12 +305,9 @@ class _HomeScreenState extends State<HomeScreen> {
       final ts = DateTime.now().millisecondsSinceEpoch;
 
       if (kind == DownloadKind.direct) {
-        // رابط ملف مباشر - تحميل مباشر بدون معالجة
-        final name = _guessFileName(url);
-        outFile = File('${dir.path}/$name');
+        outFile = File('${dir.path}/${_guessFileName(url)}');
         await _streamDownload(url, outFile);
       } else {
-        // فيديو/صوت من منصة - استخدم cobalt.tools API
         final directUrl =
             await _cobaltExtract(url, audioOnly: kind == DownloadKind.audio);
         final ext = kind == DownloadKind.audio ? 'mp3' : 'mp4';
@@ -237,16 +322,16 @@ class _HomeScreenState extends State<HomeScreen> {
         _lastStatus = 'تم الحفظ: ${outFile!.path}';
       });
       _toast('تم بنجاح ✓');
-    } catch (e) {
-      debugPrint('Download error: $e');
+    } catch (e, st) {
+      debugPrint('Download error: $e\n$st');
       if (!mounted) return;
       setState(() {
         _isDownloading = false;
         _downloadProgress = 0.0;
-        _lastStatus = 'فشل التحميل. افتح الرابط في المتصفح.';
+        _lastStatus = 'فشل التحميل: ${_shortError(e)}';
       });
-      _toast('فشل التحميل — سيتم فتح المتصفح');
       // Fallback: افتح الرابط في المتصفح
+      _toast('فشل — سيتم فتح المتصفح');
       try {
         await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
       } catch (_) {}
@@ -266,10 +351,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // cobalt.tools API — نفس yt-dlp لكن عبر HTTP
+  // استدعاء الـ API (افتراضياً cobalt.tools، أو سيرفر مخصّص)
   // ---------------------------------------------------------------------------
   Future<String> _cobaltExtract(String url, {required bool audioOnly}) async {
-    final apiUri = Uri.parse('https://api.cobalt.tools/');
     final body = jsonEncode({
       'url': url,
       'videoQuality': '1080',
@@ -278,6 +362,7 @@ class _HomeScreenState extends State<HomeScreen> {
       'filenameStyle': 'classic',
     });
 
+    final apiUri = Uri.parse(_apiBaseUrl);
     final response = await http
         .post(apiUri, headers: {
           'Accept': 'application/json',
@@ -286,7 +371,7 @@ class _HomeScreenState extends State<HomeScreen> {
         .timeout(const Duration(seconds: 30));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('API HTTP ${response.statusCode}');
+      throw Exception('API HTTP ${response.statusCode}\n${_shortError(response.body)}');
     }
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -294,14 +379,13 @@ class _HomeScreenState extends State<HomeScreen> {
     if (status == 'redirect' || status == 'tunnel') {
       return data['url'] as String;
     } else if (status == 'picker') {
-      // عدة جودات متاحة - خذ الأولى
       final picker = data['picker'] as List?;
       if (picker != null && picker.isNotEmpty) {
         return picker.first['url'] as String;
       }
       throw Exception('لم يتم العثور على رابط مباشر');
     } else {
-      throw Exception('API status: $status');
+      throw Exception('API status: $status — ${data['text'] ?? ''}');
     }
   }
 
@@ -384,6 +468,102 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ---------------------------------------------------------------------------
+  // الإعدادات (تغيير رابط الـ API)
+  // ---------------------------------------------------------------------------
+  Future<void> _openSettings() async {
+    final controller = TextEditingController(text: _apiBaseUrl);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('إعدادات الـ API'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'أدخل رابط السيرفر الخلفي الذي يستخدم yt-dlp.\n'
+              'الافتراضي: cobalt.tools (مجاني لكن قد يكون محجوباً).\n\n'
+              'للحصول على سيرفر خاص، انشر المشروع المرفق yt-dlp-server '
+              'على Render.com (مجاني).',
+              style: TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'رابط الـ API',
+                border: OutlineInputBorder(),
+                hintText: 'https://your-server.onrender.com/',
+              ),
+              keyboardType: TextInputType.url,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              controller.text = _kDefaultApiUrl;
+            },
+            child: const Text('استعادة الافتراضي'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null && result.isNotEmpty) {
+      await _saveApiUrl(result);
+      _toast('تم الحفظ ✓');
+      // اختبار بعد الحفظ
+      _testApi();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // شرح كيفية تشغيل سيرفر خاص
+  // ---------------------------------------------------------------------------
+  Future<void> _showServerGuide() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('سيرفر yt-dlp خاص'),
+        content: const SingleChildScrollView(
+          child: Text(
+            'لماذا تحتاج سيرفر خاص؟\n'
+            '• cobalt.tools قد يكون محجوباً في بعض الدول\n'
+            '• سيرفرك يكون أسرع وأكثر استقراراً\n'
+            '• تتحكم في الإعدادات بنفسك\n\n'
+            '────────────────────────────────────\n\n'
+            'خطوات النشر (مجاني على Render.com):\n\n'
+            '1) ارفع مجلد yt-dlp-server/ على GitHub\n'
+            '2) ادخل render.com → New Web Service\n'
+            '3) اختر الريبو → اضغط Deploy\n'
+            '4) انسخ الرابط (مثل: my-app.onrender.com)\n'
+            '5) في التطبيق: افتح الإعدادات والصق الرابط\n\n'
+            '────────────────────────────────────\n\n'
+            'بعدها التطبيق يتصل بسيرفرك الخاص بدل cobalt،\n'
+            'وتقدر تنزّل بلا قيود أو حجب.',
+            style: TextStyle(fontSize: 13),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('حسناً'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // الواجهة الرئيسية
   // ---------------------------------------------------------------------------
   @override
@@ -392,6 +572,13 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('مُنزّل الميديا'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'إعدادات الـ API',
+            icon: const Icon(Icons.settings),
+            onPressed: _openSettings,
+          ),
+        ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -416,10 +603,23 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('الحالة',
-                          style: TextStyle(fontWeight: FontWeight.bold)),
+                      Row(
+                        children: [
+                          Icon(
+                            _apiOnline
+                                ? Icons.check_circle
+                                : Icons.error_outline,
+                            color: _apiOnline ? Colors.green : Colors.orange,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 6),
+                          const Text('الحالة',
+                              style: TextStyle(fontWeight: FontWeight.bold)),
+                        ],
+                      ),
                       const SizedBox(height: 6),
-                      Text(_lastStatus),
+                      Text(_lastStatus,
+                          style: const TextStyle(fontSize: 13)),
                       if (_lastUrl.isNotEmpty) ...[
                         const SizedBox(height: 10),
                         const Text('آخر رابط:',
@@ -427,32 +627,65 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(height: 4),
                         SelectableText(
                           _lastUrl,
-                          style: const TextStyle(fontSize: 13),
+                          style: const TextStyle(fontSize: 12),
                         ),
                       ],
+                      const SizedBox(height: 10),
+                      Text(
+                        'الـ API: $_apiBaseUrl',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey[700],
+                        ),
+                      ),
                     ],
                   ),
                 ),
               ),
               const SizedBox(height: 16),
-              // زر اختبار: لصق رابط يدوياً لمعاينة النافذة العائمة
-              OutlinedButton.icon(
-                onPressed: () => _showManualInput(),
-                icon: const Icon(Icons.link),
-                label: const Text('اختبار برابط يدوي'),
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: _isDownloading
-                    ? null
-                    : () {
-                        setState(() {
-                          _lastUrl = '';
-                          _lastStatus = 'في انتظار مشاركة رابط...';
-                        });
-                      },
-                icon: const Icon(Icons.refresh),
-                label: const Text('إعادة التهيئة'),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: _checkingApi ? null : _testApi,
+                    icon: _checkingApi
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.wifi_find, size: 18),
+                    label: const Text('اختبار الاتصال'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _showManualInput,
+                    icon: const Icon(Icons.link, size: 18),
+                    label: const Text('اختبار برابط يدوي'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _openSettings,
+                    icon: const Icon(Icons.tune, size: 18),
+                    label: const Text('إعدادات API'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _showServerGuide,
+                    icon: const Icon(Icons.cloud_outlined, size: 18),
+                    label: const Text('سيرفر خاص'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _isDownloading
+                        ? null
+                        : () {
+                            setState(() {
+                              _lastUrl = '';
+                              _lastStatus = 'في انتظار مشاركة رابط...';
+                            });
+                          },
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('إعادة'),
+                  ),
+                ],
               ),
               const SizedBox(height: 24),
               const _Footer(),
@@ -463,7 +696,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // مربع حوار لاختبار التطبيق برابط يدوي
   Future<void> _showManualInput() async {
     final controller = TextEditingController(text: _lastUrl);
     final url = await showDialog<String>(
@@ -491,7 +723,6 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-
     if (url != null && url.isNotEmpty) {
       _handleSharedUrl(url);
     }
@@ -501,7 +732,7 @@ class _HomeScreenState extends State<HomeScreen> {
 enum DownloadKind { video, audio, direct }
 
 // =============================================================================
-// بطاقة التقدّم أثناء التحميل
+// بطاقة التقدّم
 // =============================================================================
 class _ProgressCard extends StatelessWidget {
   const _ProgressCard({
@@ -737,7 +968,7 @@ class _Header extends StatelessWidget {
             style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 4),
         Text(
-          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو حتى رابط ملف مباشر. ستظهر لك نافذة التحميل فوراً.',
+          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو حتى ملف مباشر. النافذة ستظهر فوراً.',
           style: TextStyle(color: Colors.grey[700], fontSize: 14),
         ),
       ],
@@ -750,7 +981,7 @@ class _Footer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      'مجاني 100% • بدون إعلانات • مدعوم بـ yt-dlp',
+      'مجاني 100% • بدون إعلانات • افتح "إعدادات API" لاستخدام سيرفر خاص',
       textAlign: TextAlign.center,
       style: TextStyle(color: Colors.grey[600], fontSize: 12),
     );
