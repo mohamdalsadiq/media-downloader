@@ -3,16 +3,6 @@
 // =============================================================================
 // A comprehensive video downloader app supporting YouTube, TikTok, Instagram,
 // Twitter, Facebook, and many other platforms.
-//
-// Features:
-// - Multiple quality options (360p, 480p, 720p, 1080p, 4K)
-// - Audio-only extraction (MP3)
-// - Direct share intent handling
-// - Progress tracking
-// - Custom API server support
-//
-// Author: AI Assistant
-// Version: 2.0.0
 // =============================================================================
 
 import 'dart:async';
@@ -33,7 +23,8 @@ import 'package:url_launcher/url_launcher.dart';
 // Configuration
 // =============================================================================
 const String _kApiUrlKey = 'api_base_url';
-const String _kDefaultApiUrl = 'https://api.cobalt.tools/';
+// تم تعيين رابط سيرفرك الخاص على Render كافتراضي
+const String _kDefaultApiUrl = 'https://media-downloader-api-xndz.onrender.com/';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -142,13 +133,13 @@ class VideoInfo {
     final formatsList = (json['formats'] as List? ?? [])
         .map((f) => VideoFormat.fromJson(f))
         .toList();
-    
+
     return VideoInfo(
-      title: json['title'] ?? 'Unknown',
+      title: json['title'] ?? 'فيديو بدون عنوان',
       duration: json['duration'],
       thumbnail: json['thumbnail'] ?? '',
       uploader: json['uploader'],
-      platform: json['platform'] ?? 'unknown',
+      platform: json['platform'] ?? 'ميديا',
       webpageUrl: json['webpage_url'] ?? '',
       formats: formatsList,
       bestAudio: json['best_audio'] != null
@@ -190,18 +181,20 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _checkingApi = false;
   VideoInfo? _videoInfo;
 
+  String get _normalizedApiUrl {
+    return _apiBaseUrl.endsWith('/') ? _apiBaseUrl : '$_apiBaseUrl/';
+  }
+
   @override
   void initState() {
     super.initState();
     _loadSettings();
     _checkApiHealth();
 
-    // Handle shared URLs while app is running
     _intentSub = ReceiveSharingIntent.instance
         .getMediaStream()
         .listen(_processSharedFiles, onError: _onIntentError);
 
-    // Handle shared URLs when app is opened from share
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (!mounted) return;
       _processSharedFiles(files);
@@ -215,6 +208,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (url != null && url.isNotEmpty) {
       setState(() => _apiBaseUrl = url);
     }
+    _checkApiHealth();
   }
 
   Future<void> _saveApiUrl(String url) async {
@@ -226,22 +220,22 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _checkApiHealth() async {
     setState(() => _checkingApi = true);
     try {
-      final response = await http.get(
-        Uri.parse('${_apiBaseUrl}health'),
-      ).timeout(const Duration(seconds: 10));
-      
+      final response = await http
+          .get(
+            Uri.parse('${_normalizedApiUrl}health'),
+          )
+          .timeout(const Duration(seconds: 10));
+
       setState(() {
         _apiOnline = response.statusCode == 200;
         _checkingApi = false;
-        _lastStatus = _apiOnline 
-            ? 'متصل بـ API ✓' 
-            : 'فشل الاتصال بالـ API';
+        _lastStatus = _apiOnline ? 'متصل بالسيرفر الخاص ✓' : 'فشل الاتصال بالسيرفر';
       });
     } catch (e) {
       setState(() {
         _apiOnline = false;
         _checkingApi = false;
-        _lastStatus = 'فشل الاتصال: ${e.toString().substring(0, 50)}';
+        _lastStatus = 'فشل الاتصال: ${e.toString().substring(0, min(50, e.toString().length))}';
       });
     }
   }
@@ -273,8 +267,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastStatus = 'تم استلام الرابط ✓';
       _videoInfo = null;
     });
-    
-    // Fetch video info first
+
     _fetchVideoInfo(url);
   }
 
@@ -297,31 +290,56 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _fetchVideoInfo(String url) async {
     setState(() {
       _isLoading = true;
-      _lastStatus = 'جارٍ تحميل معلومات الفيديو...';
+      _lastStatus = 'جارٍ معالجة رابط الميديا...';
     });
 
     try {
       final response = await http.post(
-        Uri.parse('${_apiBaseUrl}api/info'),
+        Uri.parse('${_normalizedApiUrl}extract'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'url': url}),
+        body: jsonEncode({'url': url, 'audio_only': false}),
       ).timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
-        if (data['status'] == 'success') {
+        if (data['status'] == 'success' || data['url'] != null) {
+          final title = data['title'] ?? 'Media Video';
+          final directUrl = data['url'];
+          final ext = data['ext'] ?? 'mp4';
+
+          final info = VideoInfo(
+            title: title,
+            thumbnail: data['thumbnail'] ?? '',
+            platform: data['site'] ?? 'Direct',
+            webpageUrl: url,
+            formats: [
+              VideoFormat(
+                quality: 'best',
+                qualityLabel: 'جودة عالية (MP4)',
+                formatId: 'best',
+                ext: ext,
+                url: directUrl,
+              )
+            ],
+            bestAudio: VideoFormat(
+              quality: 'audio',
+              qualityLabel: 'صوت (MP3)',
+              formatId: 'audio',
+              ext: 'mp3',
+            ),
+          );
+
           setState(() {
-            _videoInfo = VideoInfo.fromJson(data['data']);
+            _videoInfo = info;
             _isLoading = false;
-            _lastStatus = 'تم تحميل معلومات الفيديو ✓';
+            _lastStatus = 'تم تجهيز رابط التحميل ✓';
           });
-          
-          // Show quality selection
+
           if (mounted) {
             _showQualitySelectionSheet(url);
           }
         } else {
-          throw Exception(data['error'] ?? 'Unknown error');
+          throw Exception(data['error'] ?? 'فشل استخراج الفيديو');
         }
       } else {
         throw Exception('HTTP ${response.statusCode}');
@@ -329,9 +347,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       setState(() {
         _isLoading = false;
-        _lastStatus = 'فشل تحميل المعلومات: ${e.toString()}';
+        _lastStatus = 'فشل معالجة الرابط: ${e.toString()}';
       });
-      _toast('فشل تحميل معلومات الفيديو');
+      _toast('فشل جلب معلومات التحميل');
     }
   }
 
@@ -362,14 +380,12 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // Check connection
     final connectivity = await Connectivity().checkConnectivity();
     if (connectivity.every((r) => r == ConnectivityResult.none)) {
       _toast('لا يوجد اتصال إنترنت');
       return;
     }
 
-    // Check permissions
     final ok = await _ensurePermissions();
     if (!ok) {
       _toast('يجب منح صلاحيات التخزين');
@@ -381,14 +397,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _downloadProgress = 0.0;
       _receivedBytes = 0;
       _totalBytes = 0;
-      _lastStatus = audioOnly ? 'جارٍ تحميل الصوت...' : 'جارٍ تحميل الفيديو ($quality)...';
+      _lastStatus = audioOnly ? 'جارٍ تحميل الصوت...' : 'جارٍ تحميل الفيديو...';
     });
 
     File? outFile;
     try {
-      // Extract direct URL
       final extractResponse = await http.post(
-        Uri.parse('${_apiBaseUrl}api/extract'),
+        Uri.parse('${_normalizedApiUrl}extract'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'url': url,
@@ -402,28 +417,27 @@ class _HomeScreenState extends State<HomeScreen> {
       }
 
       final extractData = jsonDecode(extractResponse.body);
-      if (extractData['status'] != 'success') {
-        throw Exception(extractData['error'] ?? 'Failed to extract URL');
+      final directUrl = extractData['url'] as String?;
+      if (directUrl == null) {
+        throw Exception(extractData['error'] ?? 'تعذر الحصول على رابط التنزيل المباشر');
       }
 
-      final directUrl = extractData['data']['url'] as String;
-      final ext = extractData['data']['ext'] as String;
-      final title = extractData['data']['title'] as String;
+      final ext = audioOnly ? 'mp3' : (extractData['ext'] ?? 'mp4');
+      final title = extractData['title'] ?? 'Media_File';
 
-      // Prepare output file
       final dir = await _downloadsDir();
       final ts = DateTime.now().millisecondsSinceEpoch;
-      final safeTitle = title.replaceAll(RegExp(r'[<>"/\\|?*]'), '_').substring(0, min(50, title.length));
-      outFile = File('${dir.path}/${safeTitle}_$ts.$ext');
+      final safeTitle = title.replaceAll(RegExp(r'[<>"/\\|?*]'), '_');
+      final truncatedTitle = safeTitle.substring(0, min(30, safeTitle.length));
+      outFile = File('${dir.path}/${truncatedTitle}_$ts.$ext');
 
-      // Download file
       await _streamDownload(directUrl, outFile);
 
       if (!mounted) return;
       setState(() {
         _isDownloading = false;
         _downloadProgress = 0.0;
-        _lastStatus = 'تم الحفظ: ${outFile!.path}';
+        _lastStatus = 'تم الحفظ في المعرض / التنزيلات';
       });
       _toast('تم التحميل بنجاح ✓');
     } catch (e, st) {
@@ -432,9 +446,9 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _isDownloading = false;
         _downloadProgress = 0.0;
-        _lastStatus = 'فشل التحميل: ${e.toString().substring(0, 100)}';
+        _lastStatus = 'فشل التحميل المباشر';
       });
-      _toast('فشل التحميل - سيتم فتح المتصفح');
+      _toast('فشل التحميل - جاري الفتح عبر المتصفح');
       try {
         await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
       } catch (_) {}
@@ -513,24 +527,18 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Settings
-  // ---------------------------------------------------------------------------
   Future<void> _openSettings() async {
     final controller = TextEditingController(text: _apiBaseUrl);
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('إعدادات الـ API'),
+        title: const Text('إعدادات السيرفر (API)'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'أدخل رابط السيرفر الخلفي.\n'
-              'الافتراضي: api.cobalt.tools (مجاني).\n\n'
-              'للحصول على سيرفر خاص، انشر المشروع yt-dlp-server '
-              'على Render.com (مجاني).',
+              'رابط سيرفر Render الخاص بك مضبوط تلقائياً.',
               style: TextStyle(fontSize: 12),
             ),
             const SizedBox(height: 12),
@@ -539,7 +547,6 @@ class _HomeScreenState extends State<HomeScreen> {
               decoration: const InputDecoration(
                 labelText: 'رابط الـ API',
                 border: OutlineInputBorder(),
-                hintText: 'https://your-server.onrender.com/',
               ),
               keyboardType: TextInputType.url,
             ),
@@ -564,14 +571,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (result != null && result.isNotEmpty) {
       await _saveApiUrl(result);
-      _toast('تم الحفظ ✓');
-      _checkApiHealth();
+      _toast('تم حفظ الإعدادات ✓');
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Build UI
-  // ---------------------------------------------------------------------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -594,8 +597,6 @@ class _HomeScreenState extends State<HomeScreen> {
             children: [
               const _Header(),
               const SizedBox(height: 20),
-              
-              // Progress Card
               if (_isLoading)
                 const _LoadingCard()
               else if (_isDownloading)
@@ -605,21 +606,15 @@ class _HomeScreenState extends State<HomeScreen> {
                   total: _totalBytes,
                   status: _lastStatus,
                 ),
-              
               if (_isLoading || _isDownloading) const SizedBox(height: 16),
-              
-              // Status Card
               _StatusCard(
                 status: _lastStatus,
                 apiOnline: _apiOnline,
                 lastUrl: _lastUrl,
-                apiBaseUrl: _apiBaseUrl,
+                apiBaseUrl: _normalizedApiUrl,
                 isChecking: _checkingApi,
               ),
-              
               const SizedBox(height: 16),
-              
-              // Action Buttons
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
@@ -633,21 +628,15 @@ class _HomeScreenState extends State<HomeScreen> {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.wifi_find, size: 18),
-                    label: const Text('اختبار الاتصال'),
+                    label: const Text('فحص السيرفر'),
                   ),
                   OutlinedButton.icon(
                     onPressed: _showManualInput,
                     icon: const Icon(Icons.link, size: 18),
-                    label: const Text('اختبار برابط يدوي'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: _openSettings,
-                    icon: const Icon(Icons.tune, size: 18),
-                    label: const Text('إعدادات API'),
+                    label: const Text('تحميل رابط يدوي'),
                   ),
                 ],
               ),
-              
               const SizedBox(height: 24),
               const _Footer(),
             ],
@@ -662,7 +651,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final url = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('اختبار برابط'),
+        title: const Text('لصق رابط للتنزيل'),
         content: TextField(
           controller: controller,
           decoration: const InputDecoration(
@@ -679,7 +668,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           FilledButton(
             onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
-            child: const Text('متابعة'),
+            child: const Text('تنزيل'),
           ),
         ],
       ),
@@ -723,27 +712,6 @@ class QualitySelectionSheet extends StatelessWidget {
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
-            
-            // Video Thumbnail
-            if (videoInfo.thumbnail.isNotEmpty)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.network(
-                  videoInfo.thumbnail,
-                  height: 150,
-                  width: double.infinity,
-                  fit: BoxFit.cover,
-                  errorBuilder: (context, error, stackTrace) => Container(
-                    height: 150,
-                    color: Colors.grey[300],
-                    child: const Icon(Icons.video_library, size: 50),
-                  ),
-                ),
-              ),
-            
-            const SizedBox(height: 16),
-            
-            // Video Title
             Text(
               videoInfo.title,
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
@@ -751,62 +719,25 @@ class QualitySelectionSheet extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.center,
             ),
-            
-            const SizedBox(height: 4),
-            
-            // Video Info
-            Text(
-              '${videoInfo.platform} • ${videoInfo.durationDisplay}',
-              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-            ),
-            
-            const SizedBox(height: 20),
-            const Divider(),
-            const SizedBox(height: 12),
-            
-            // Quality Options
-            const Text(
-              'اختر الجودة',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-            ),
-            
-            const SizedBox(height: 12),
-            
-            // Available Formats
-            ...videoInfo.formats.take(5).map((format) => _QualityButton(
-              icon: Icons.videocam,
-              label: format.qualityLabel,
-              subtitle: format.displaySize,
-              onTap: () => onQualitySelected(format.quality, false),
-            )),
-            
-            // Best Quality Option
-            if (videoInfo.formats.isNotEmpty)
-              _QualityButton(
-                icon: Icons.high_quality,
-                label: 'أفضل جودة متاحة',
-                subtitle: 'تلقائي',
-                filled: true,
-                onTap: () => onQualitySelected('best', false),
-              ),
-            
-            const SizedBox(height: 12),
-            const Divider(),
-            const SizedBox(height: 12),
-            
-            // Audio Only Option
-            if (videoInfo.bestAudio != null)
-              _QualityButton(
-                icon: Icons.music_note,
-                label: 'صوت فقط (MP3)',
-                subtitle: videoInfo.bestAudio!.displaySize,
-                filled: false,
-                onTap: () => onQualitySelected('audio', true),
-              ),
-            
             const SizedBox(height: 16),
-            
-            // Cancel Button
+            const Divider(),
+            const SizedBox(height: 12),
+            _QualityButton(
+              icon: Icons.high_quality,
+              label: 'تحميل الفيديو (MP4)',
+              subtitle: 'أفضل جودة متوفرة',
+              filled: true,
+              onTap: () => onQualitySelected('best', false),
+            ),
+            const SizedBox(height: 8),
+            _QualityButton(
+              icon: Icons.music_note,
+              label: 'تحميل الصوت فقط (MP3)',
+              subtitle: 'ملف صوتي فقط',
+              filled: false,
+              onTap: () => onQualitySelected('audio', true),
+            ),
+            const SizedBox(height: 16),
             TextButton.icon(
               onPressed: onCancel,
               icon: const Icon(Icons.close, size: 18),
@@ -840,36 +771,33 @@ class _QualityButton extends StatelessWidget {
         ? Theme.of(context).colorScheme.onPrimary
         : Theme.of(context).colorScheme.primary;
     final bg = filled ? Theme.of(context).colorScheme.primary : Colors.transparent;
-    
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: SizedBox(
-        width: double.infinity,
-        height: 56,
-        child: filled
-            ? ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: bg,
-                  foregroundColor: fg,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
+
+    return SizedBox(
+      width: double.infinity,
+      height: 56,
+      child: filled
+          ? ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: bg,
+                foregroundColor: fg,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
                 ),
-                onPressed: onTap,
-                child: _content(context, fg),
-              )
-            : OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: fg,
-                  side: BorderSide(color: Theme.of(context).colorScheme.primary),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                onPressed: onTap,
-                child: _content(context, fg),
               ),
-      ),
+              onPressed: onTap,
+              child: _content(context, fg),
+            )
+          : OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: fg,
+                side: BorderSide(color: Theme.of(context).colorScheme.primary),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              onPressed: onTap,
+              child: _content(context, fg),
+            ),
     );
   }
 
@@ -926,7 +854,7 @@ class _Header extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(
-          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو حتى ملف مباشر. النافذة ستظهر فوراً.',
+          'شارك أي رابط من تيك توك، إنستغرام، يوتيوب، X، أو اضغط زر "تحميل رابط يدوي".',
           style: TextStyle(color: Colors.grey[700], fontSize: 14),
         ),
       ],
@@ -940,7 +868,7 @@ class _Footer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      'مجاني 100% • بدون إعلانات • افتح "إعدادات API" لاستخدام سيرفر خاص',
+      'تطبيق متصل بسيرفرك الخاص بنجاح • بدون إعلانات',
       textAlign: TextAlign.center,
       style: TextStyle(color: Colors.grey[600], fontSize: 12),
     );
@@ -965,7 +893,7 @@ class _LoadingCard extends StatelessWidget {
               child: CircularProgressIndicator(strokeWidth: 2),
             ),
             SizedBox(width: 12),
-            Text('جارٍ تحميل المعلومات...'),
+            Text('جارٍ معالجة التنزيل من السيرفر...'),
           ],
         ),
       ),
@@ -1072,7 +1000,7 @@ class _StatusCard extends StatelessWidget {
                         size: 18,
                       ),
                 const SizedBox(width: 6),
-                const Text('الحالة', style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text('حالة السيرفر', style: TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 6),
